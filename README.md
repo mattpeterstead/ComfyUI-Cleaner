@@ -89,3 +89,7 @@ Run the focused safety tests with:
 ```powershell
 python -m unittest -v
 ```
+
+## License
+
+Licensed under the [MIT License](LICENSE).
