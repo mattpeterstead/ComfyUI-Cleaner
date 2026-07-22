@@ -1,0 +1,27 @@
+# Local application data
+backups/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editor and Codex workspace data
+.vscode/
+.idea/
+.codex/
+.agents/
+
+# Test scratch directories
+.backup-test-*/
+tests/browser-backups/

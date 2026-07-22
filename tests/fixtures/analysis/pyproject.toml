@@ -1,0 +1,9 @@
+[project]
+dependencies = ["project-runtime>=1"]
+
+[project.optional-dependencies]
+optional = ["project-optional>=2"]
+
+[tool.poetry.dependencies]
+python = ">=3.11"
+poetry-runtime = "^1.0"
