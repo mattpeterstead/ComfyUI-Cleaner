@@ -24,4 +24,6 @@ env/
 
 # Test scratch directories
 .backup-test-*/
+.path-test-*/
 tests/browser-backups/
+.compat/

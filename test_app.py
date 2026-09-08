@@ -1,13 +1,40 @@
 import json
 import shutil
 import tempfile
+import threading
 import unittest
+import urllib.request
 import zipfile
 from types import SimpleNamespace
 from unittest.mock import patch
 from pathlib import Path
 
 import app
+
+
+class ServerLifecycleTests(unittest.TestCase):
+    def test_shutdown_endpoint_stops_the_server(self) -> None:
+        server = app.ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        try:
+            host, port = server.server_address
+            request = urllib.request.Request(
+                f"http://{host}:{port}/api/shutdown",
+                data=b"{}",
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=2) as response:
+                result = json.load(response)
+
+            self.assertTrue(result["ok"])
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
 
 
 class PythonPackageSafetyTests(unittest.TestCase):
@@ -119,6 +146,23 @@ class ScanValidationTests(unittest.TestCase):
             {"BypassedNode", "MutedNode"},
         )
 
+    def test_workflow_v1_and_nested_subgraph_nodes_are_counted(self) -> None:
+        workflow = {
+            "version": 1,
+            "state": {"lastNodeId": 1},
+            "nodes": [{"id": 1, "type": "TopLevelNode", "mode": 0}],
+            "definitions": {
+                "subgraphs": [
+                    {"nodes": [{"id": "nested", "type": "NestedNode", "mode": 4}]}
+                ]
+            },
+        }
+
+        self.assertEqual(
+            app.extract_workflow_node_types(workflow),
+            {"TopLevelNode", "NestedNode"},
+        )
+
     def test_png_workflow_metadata_is_read(self) -> None:
         embedded = '{"nodes":[{"type":"EmbeddedNode","mode":4}]}'
         with patch("app.png_text_metadata", return_value={"workflow": embedded}):
@@ -142,6 +186,43 @@ class ScanValidationTests(unittest.TestCase):
         self.assertEqual(len(result["errors"]), 3)
         self.assertEqual(result["workflow"]["files_scanned"], 0)
         self.assertEqual(result["custom_nodes"], [])
+
+
+class CurrentComfyUIPathTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.root = Path(__file__).parent / f".path-test-{app.uuid.uuid4().hex}"
+        self.comfyui = self.root / "ComfyUI"
+        self.comfyui.mkdir(parents=True)
+        (self.comfyui / "main.py").write_text("", encoding="utf-8")
+        (self.comfyui / "comfyui_version.py").write_text('__version__ = "0.34.0"\n', encoding="utf-8")
+        embedded_python = self.root / "python_embeded" / "python.exe"
+        embedded_python.parent.mkdir(parents=True)
+        embedded_python.write_text("placeholder", encoding="utf-8")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_portable_root_resolves_comfyui_and_embedded_python(self) -> None:
+        result = app.default_paths_for_comfy(str(self.root))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["comfyui_path"], str(self.comfyui.resolve()))
+        self.assertEqual(result["venv_path"], str((self.root / "python_embeded").resolve()))
+        self.assertEqual(
+            result["workflows_path"],
+            str((self.comfyui / "user" / "default" / "workflows").resolve()),
+        )
+
+    def test_current_comfyui_version_file_is_read_without_importing_it(self) -> None:
+        self.assertEqual(app.detect_comfyui_version(self.comfyui), "0.34.0")
+
+    def test_existing_non_comfyui_folder_is_rejected(self) -> None:
+        workflows = self.root / "workflows"
+        workflows.mkdir()
+
+        result = app.run_scan(str(workflows), str(self.root / "python_embeded"), str(workflows))
+
+        self.assertIn("The selected ComfyUI path is invalid: main.py was not found.", result["errors"])
 
 
 class DetectionCertaintyTests(unittest.TestCase):
@@ -234,6 +315,51 @@ class DetectionCertaintyTests(unittest.TestCase):
 
         self.assertEqual(packages[0].status, "used")
         self.assertEqual(packages[0].confidence, "high")
+
+    def test_v3_extension_is_resolved_across_package_files(self) -> None:
+        custom_nodes = Path(__file__).parent / "tests" / "fixtures" / "v3_comfyui" / "custom_nodes"
+        packages = app.scan_custom_nodes(custom_nodes, {"CleanerV3Example"})
+        package = next(item for item in packages if item.name == "v3_example")
+
+        self.assertEqual(package.status, "used")
+        self.assertEqual(package.confidence, "high")
+        self.assertEqual(package.node_types, {"CleanerV3Example"})
+        self.assertIn("static V3 extension registration", package.evidence)
+
+    def test_v3_schema_positional_node_id_is_supported(self) -> None:
+        source = """
+class PositionalNode:
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(\"PositionalV3Node\")
+"""
+        tree = app.ast.parse(source)
+        class_node = next(node for node in tree.body if isinstance(node, app.ast.ClassDef))
+
+        self.assertEqual(app.v3_schema_node_ids(class_node), ({"PositionalV3Node"}, True))
+
+    def test_unused_static_v3_extension_is_high_confidence(self) -> None:
+        custom_nodes = Path(__file__).parent / "tests" / "fixtures" / "v3_comfyui" / "custom_nodes"
+        packages = app.scan_custom_nodes(custom_nodes, set())
+        package = next(item for item in packages if item.name == "v3_example")
+
+        self.assertEqual(package.status, "unused")
+        self.assertEqual(package.confidence, "high")
+
+    def test_dynamic_v3_extension_is_never_removable(self) -> None:
+        custom_nodes = Path(__file__).parent / "tests" / "fixtures" / "v3_comfyui" / "custom_nodes"
+        packages = app.scan_custom_nodes(custom_nodes, set())
+        package = next(item for item in packages if item.name == "dynamic_v3")
+
+        self.assertEqual(package.status, "unknown")
+        self.assertEqual(package.confidence, "low")
+        self.assertIn("dynamic or unresolved V3 extension registration", package.evidence)
+
+    def test_disabled_custom_node_package_is_skipped_like_comfyui(self) -> None:
+        custom_nodes = Path(__file__).parent / "tests" / "fixtures" / "v3_comfyui" / "custom_nodes"
+        packages = app.scan_custom_nodes(custom_nodes, set())
+
+        self.assertNotIn("ignored.disabled", {item.name for item in packages})
 
 
 class BackupManagementTests(unittest.TestCase):

@@ -30,11 +30,12 @@ http://127.0.0.1:8765
 
 - Paths can be typed manually or selected with the `Browse` buttons, which open the system folder picker dialog.
 - The ComfyUI installation, virtual environment, and workflows paths must all be set before scanning.
+- The selected ComfyUI folder is validated by checking for `main.py`; a Windows Portable parent folder is normalized to its nested `ComfyUI` folder.
 - When the ComfyUI installation path is set, the workflows path is filled automatically as `ComfyUI\user\default\workflows` if the field has not been set manually.
 - The application also checks common venv paths such as `ComfyUI\venv`, `ComfyUI\.venv`, `..\venv`, and `..\.venv`, and fills the virtual environment path if a suitable Python interpreter is found.
 - Reads ComfyUI workflow JSON files and embedded `workflow`/`prompt` metadata from PNG files. Bypassed and muted nodes still count as used.
 - Reads package directories and standalone Python nodes under `ComfyUI/custom_nodes`.
-- Resolves static `NODE_CLASS_MAPPINGS` assignments, dictionary constructors, merges, updates, and key assignments.
+- Resolves legacy V1 `NODE_CLASS_MAPPINGS` assignments and modern V3 `comfy_entrypoint` / `get_node_list` / `Schema(node_id=...)` registrations.
 - Marks a custom node package as unused only when its mapping is complete, every workflow file was read successfully, and no scanned workflow uses its node types. Dynamic or incomplete mappings remain `unknown`.
 - Reads installed Python packages from the selected virtual environment.
 - Compares Python packages against regular and literal dynamic imports, Python module/command invocations, recursive requirements files, `pyproject.toml`, `setup.cfg`, `setup.py`, installed dependency metadata, startup hooks, and plugin entry points.
@@ -42,6 +43,7 @@ http://127.0.0.1:8765
 - Shows scan progress, a phase log, elapsed time, and an estimated remaining time while scanning.
 - Provides per-list select and deselect controls and can estimate the total file size of the current cleanup selection.
 - Runs only one scan or cleanup operation at a time and prevents shutdown while one is active.
+- Recognizes a Windows Portable root containing `ComfyUI` and its sibling `python_embeded` directory.
 
 ## Cleanup
 

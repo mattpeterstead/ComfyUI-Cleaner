@@ -323,11 +323,36 @@ def pick_local_path(title: str, initial_path_raw: str = "") -> dict[str, Any]:
     return {"ok": True, "path": selected or "", "cancelled": not bool(selected)}
 
 
+def resolve_comfyui_installation_path(path: Path) -> Path:
+    nested = path / "ComfyUI"
+    if not (path / "main.py").is_file() and (nested / "main.py").is_file():
+        return nested.resolve()
+    return path.resolve()
+
+
+def detect_comfyui_version(comfyui_path: Path) -> str | None:
+    version_path = comfyui_path / "comfyui_version.py"
+    if version_path.is_file():
+        try:
+            tree = ast.parse(version_path.read_text(encoding="utf-8", errors="ignore"))
+            for statement in tree.body:
+                if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                    continue
+                targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+                if any(isinstance(target, ast.Name) and target.id == "__version__" for target in targets):
+                    version = static_string(statement.value)
+                    if version:
+                        return version
+        except Exception:
+            return None
+    return None
+
+
 def default_paths_for_comfy(comfyui_path_raw: str) -> dict[str, Any]:
     if not comfyui_path_raw.strip():
         return {"ok": False, "error": "ComfyUI path is missing."}
 
-    comfyui_path = safe_resolve(comfyui_path_raw)
+    comfyui_path = resolve_comfyui_installation_path(safe_resolve(comfyui_path_raw))
     workflows_path = comfyui_path / "user" / "default" / "workflows"
 
     venv_candidates = [
@@ -335,6 +360,10 @@ def default_paths_for_comfy(comfyui_path_raw: str) -> dict[str, Any]:
         comfyui_path / ".venv",
         comfyui_path.parent / "venv",
         comfyui_path.parent / ".venv",
+        comfyui_path / "python_embeded",
+        comfyui_path.parent / "python_embeded",
+        comfyui_path / "python_embedded",
+        comfyui_path.parent / "python_embedded",
     ]
 
     found_venv = None
@@ -394,6 +423,10 @@ class PythonFileAnalysis:
     declared_requirements: set[str] = field(default_factory=set)
     invoked_commands: set[str] = field(default_factory=set)
     usage_uncertain: bool = False
+    v3_entrypoint_declared: bool = False
+    v3_entrypoint_extensions: set[str] = field(default_factory=set)
+    v3_extension_nodes: dict[str, tuple[set[str], bool]] = field(default_factory=dict)
+    v3_schema_nodes: dict[str, tuple[set[str], bool]] = field(default_factory=dict)
 
 
 def static_string(value: ast.AST | None) -> str | None:
@@ -473,6 +506,110 @@ def static_command_tokens(value: ast.AST | None) -> list[str]:
         return text.split()
 
 
+def reference_name(value: ast.AST | None) -> str | None:
+    if isinstance(value, ast.Name):
+        return value.id
+    if isinstance(value, ast.Attribute):
+        return value.attr
+    if isinstance(value, ast.Call):
+        return reference_name(value.func)
+    if isinstance(value, ast.Await):
+        return reference_name(value.value)
+    return None
+
+
+def static_reference_collection(value: ast.AST | None) -> tuple[set[str], bool]:
+    if not isinstance(value, (ast.List, ast.Tuple, ast.Set)):
+        return set(), False
+    references: set[str] = set()
+    complete = True
+    for item in value.elts:
+        name = reference_name(item)
+        if name:
+            references.add(name)
+        else:
+            complete = False
+    return references, complete
+
+
+def function_return_values(function: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.AST | None]:
+    returns: list[ast.AST | None] = []
+
+    class ReturnVisitor(ast.NodeVisitor):
+        def visit_Return(self, node: ast.Return) -> None:
+            returns.append(node.value)
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            if node is function:
+                self.generic_visit(node)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            if node is function:
+                self.generic_visit(node)
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            return
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            return
+
+    ReturnVisitor().visit(function)
+    return returns
+
+
+def class_method(
+    class_node: ast.ClassDef,
+    method_name: str,
+) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+    for statement in class_node.body:
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)) and statement.name == method_name:
+            return statement
+    return None
+
+
+def v3_schema_node_ids(class_node: ast.ClassDef) -> tuple[set[str], bool] | None:
+    method = class_method(class_node, "define_schema")
+    if method is None:
+        return None
+    node_ids: set[str] = set()
+    complete = True
+    returns = function_return_values(method)
+    if not returns:
+        return set(), False
+    for value in returns:
+        call = value.value if isinstance(value, ast.Await) else value
+        if not isinstance(call, ast.Call) or call_name(call).split(".")[-1] != "Schema":
+            complete = False
+            continue
+        keyword = next((item for item in call.keywords if item.arg == "node_id"), None)
+        node_id = static_string(keyword.value) if keyword else None
+        if node_id is None and call.args:
+            node_id = static_string(call.args[0])
+        if node_id:
+            node_ids.add(node_id)
+        else:
+            complete = False
+    return node_ids, complete
+
+
+def v3_extension_node_classes(class_node: ast.ClassDef) -> tuple[set[str], bool] | None:
+    if not any((reference_name(base) or "").endswith("ComfyExtension") for base in class_node.bases):
+        return None
+    method = class_method(class_node, "get_node_list")
+    if method is None:
+        return set(), False
+    references: set[str] = set()
+    complete = True
+    returns = function_return_values(method)
+    if not returns:
+        return set(), False
+    for value in returns:
+        names, return_complete = static_reference_collection(value)
+        references.update(names)
+        complete = complete and return_complete
+    return references, complete
+
+
 def parse_python_file(path: Path) -> PythonFileAnalysis:
     result = PythonFileAnalysis()
     try:
@@ -491,6 +628,26 @@ def parse_python_file(path: Path) -> PythonFileAnalysis:
             for target in targets:
                 if isinstance(target, ast.Name):
                     known_mappings[target.id] = (set(keys), complete)
+
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)) and statement.name == "comfy_entrypoint":
+            result.v3_entrypoint_declared = True
+            returns = function_return_values(statement)
+            for value in returns:
+                extension_name = reference_name(value)
+                if extension_name:
+                    result.v3_entrypoint_extensions.add(extension_name)
+            if returns and len(result.v3_entrypoint_extensions) == len(returns):
+                result.evidence.add("static V3 comfy_entrypoint")
+            else:
+                result.evidence.add("dynamic V3 comfy_entrypoint")
+
+        if isinstance(statement, ast.ClassDef):
+            schema = v3_schema_node_ids(statement)
+            if schema is not None:
+                result.v3_schema_nodes[statement.name] = schema
+            extension_nodes = v3_extension_node_classes(statement)
+            if extension_nodes is not None:
+                result.v3_extension_nodes[statement.name] = extension_nodes
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -975,6 +1132,7 @@ def scan_custom_nodes(
         for child in sorted(custom_nodes_dir.iterdir(), key=lambda p: p.name.lower())
         if not child.name.startswith(".")
         and child.name != "_comfyui_cleaner_removed"
+        and not child.name.endswith(".disabled")
         and (child.is_dir() or (child.is_file() and child.suffix.lower() == ".py" and child.name != "__init__.py"))
     ]
     total = max(1, len(children))
@@ -993,6 +1151,11 @@ def scan_custom_nodes(
         source_requirements: set[str] = set()
         invoked_commands: set[str] = set()
         usage_uncertain = False
+        v3_entrypoint_declared = False
+        v3_entrypoint_extensions: set[str] = set()
+        v3_extension_nodes: dict[str, tuple[set[str], bool]] = {}
+        v3_schema_nodes: dict[str, tuple[set[str], bool]] = {}
+        entry_file = child if child.is_file() else child / "__init__.py"
         for file_path in py_files:
             analysis = parse_python_file(file_path)
             imports.update(analysis.imports)
@@ -1007,6 +1170,36 @@ def scan_custom_nodes(
             source_requirements.update(analysis.declared_requirements)
             invoked_commands.update(analysis.invoked_commands)
             usage_uncertain = usage_uncertain or analysis.usage_uncertain or not analysis.parse_ok
+            if file_path == entry_file and analysis.v3_entrypoint_declared:
+                v3_entrypoint_declared = True
+                v3_entrypoint_extensions.update(analysis.v3_entrypoint_extensions)
+            v3_extension_nodes.update(analysis.v3_extension_nodes)
+            v3_schema_nodes.update(analysis.v3_schema_nodes)
+
+        if v3_entrypoint_declared:
+            v3_complete = bool(v3_entrypoint_extensions)
+            v3_registered_classes: set[str] = set()
+            for extension_name in v3_entrypoint_extensions:
+                extension = v3_extension_nodes.get(extension_name)
+                if extension is None:
+                    v3_complete = False
+                    continue
+                classes, extension_complete = extension
+                v3_registered_classes.update(classes)
+                v3_complete = v3_complete and extension_complete
+            if not v3_registered_classes:
+                v3_complete = False
+            for class_name in v3_registered_classes:
+                schema = v3_schema_nodes.get(class_name)
+                if schema is None:
+                    v3_complete = False
+                    continue
+                schema_node_ids, schema_complete = schema
+                node_types.update(schema_node_ids)
+                v3_complete = v3_complete and schema_complete and bool(schema_node_ids)
+            mapping_declared = True
+            mapping_complete = mapping_complete and v3_complete
+            evidence.add("static V3 extension registration" if v3_complete else "dynamic or unresolved V3 extension registration")
 
         if parse_failures:
             mapping_complete = False
@@ -1032,9 +1225,9 @@ def scan_custom_nodes(
             confidence = "low"
             matched = set()
             if not mapping_declared:
-                evidence.add("NODE_CLASS_MAPPINGS declaration was not found")
+                evidence.add("NODE_CLASS_MAPPINGS or comfy_entrypoint declaration was not found")
             elif not mapping_complete:
-                evidence.add("NODE_CLASS_MAPPINGS could not be resolved completely")
+                evidence.add("custom node registration could not be resolved completely")
             elif not workflow_scan_complete:
                 evidence.add("one or more workflow files could not be read")
 
@@ -1076,6 +1269,8 @@ def scan_custom_nodes(
 
 def find_venv_python(venv_path: Path) -> Path | None:
     candidates = [
+        venv_path / "python.exe",
+        venv_path / "python",
         venv_path / "Scripts" / "python.exe",
         venv_path / "Scripts" / "python",
         venv_path / "bin" / "python",
@@ -1432,12 +1627,14 @@ def run_scan(
             "notes": ["Set all required paths before scanning."],
         }
 
-    comfyui_path = safe_resolve(comfyui_path_raw)
+    comfyui_path = resolve_comfyui_installation_path(safe_resolve(comfyui_path_raw))
     venv_path = safe_resolve(venv_path_raw)
     workflows_path = safe_resolve(workflows_path_raw)
 
     if not comfyui_path.exists():
         errors.append("ComfyUI path does not exist.")
+    elif not (comfyui_path / "main.py").is_file():
+        errors.append("The selected ComfyUI path is invalid: main.py was not found.")
     if not workflows_path.exists():
         errors.append("Workflows path does not exist.")
     if not venv_path.exists():
@@ -1473,6 +1670,8 @@ def run_scan(
             },
             "notes": ["Correct the invalid paths before scanning again."],
         }
+
+    comfyui_version = detect_comfyui_version(comfyui_path)
 
     progress(8, "Workflows", "Scanning workflow JSON files and PNG metadata.")
     workflow_result = scan_workflows(workflows_path, progress_callback=progress, progress_start=10, progress_end=30)
@@ -1525,6 +1724,7 @@ def run_scan(
         "scan_id": scan_id,
         "paths": {
             "comfyui": str(comfyui_path),
+            "comfyui_version": comfyui_version,
             "custom_nodes": str(custom_nodes_dir),
             "venv": str(venv_path),
             "venv_python": venv_info.get("python"),
@@ -1560,8 +1760,9 @@ def run_scan(
         ],
         "python_packages": python_summary,
         "notes": [
+            *([f"Detected ComfyUI version {comfyui_version}."] if comfyui_version else []),
             "Bypassed and muted nodes remain in workflow node lists and are counted as used.",
-            "A custom node package is considered unused only when its NODE_CLASS_MAPPINGS can be resolved completely and none of the scanned workflows use those node types.",
+            "A custom node package is considered unused only when its V1 NODE_CLASS_MAPPINGS or V3 comfy_entrypoint registration can be resolved completely and none of the scanned workflows use those node types.",
             "Incomplete, dynamic, imported-from-unknown, or unparsable node mappings remain unknown and are never offered for removal.",
             "Python detection uses literal dynamic imports, requirements files, pyproject.toml, setup.cfg, setup.py, dependency metadata, and non-CLI entry-point protection.",
             *(
@@ -3619,7 +3820,6 @@ HTML = r"""<!doctype html>
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "ComfyUICleaner/1.0"
-    app_server: ThreadingHTTPServer | None = None
 
     def log_message(self, format: str, *args: Any) -> None:
         sys.stderr.write("%s - %s\n" % (self.address_string(), format % args))
@@ -3778,13 +3978,12 @@ class Handler(BaseHTTPRequestHandler):
                 if block_reason:
                     self.send_json({"ok": False, "error": block_reason}, 409)
                     return
+                server = self.server
                 self.send_json({"ok": True, "message": "Server is shutting down."})
 
                 def shutdown_server() -> None:
-                    time.sleep(1.0)
-                    server = type(self).app_server
-                    if server:
-                        server.shutdown()
+                    time.sleep(0.25)
+                    server.shutdown()
 
                 threading.Thread(target=shutdown_server, daemon=True).start()
                 return
@@ -3801,7 +4000,6 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     server = ThreadingHTTPServer((APP_HOST, APP_PORT), Handler)
-    Handler.app_server = server
     print(f"ComfyUI Cleaner: http://{APP_HOST}:{APP_PORT}")
     try:
         server.serve_forever()
