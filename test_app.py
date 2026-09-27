@@ -12,6 +12,65 @@ from pathlib import Path
 import app
 
 
+class SettingsResetTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(__file__).parent / f".path-test-{app.uuid.uuid4().hex}"
+        self.root.mkdir()
+        self.addCleanup(shutil.rmtree, self.root)
+        (self.root / "main.py").touch()
+        self.target = self.root / "user" / "default" / "comfy.settings.json"
+        self.target.parent.mkdir(parents=True)
+        self.original = b'{"Comfy.Test": true}'
+        self.target.write_bytes(self.original)
+        self.payload = {"comfyui_path": str(self.root), "backup_path": str(self.root / "backups"), "confirmed_stopped": True}
+
+    def test_reset_and_restore_preserve_workflows_and_back_up_replaced_settings(self):
+        workflow = self.target.parent / "workflows" / "example.json"
+        workflow.parent.mkdir()
+        workflow.write_text("workflow")
+        preview = app.reset_settings(self.payload, preview=True)
+        self.assertEqual(self.target.read_bytes(), self.original)
+        reset = app.reset_settings({**self.payload, "sha256": preview["sha256"]})
+        self.assertEqual(json.loads(self.target.read_bytes()), {})
+        self.assertEqual(workflow.read_text(), "workflow")
+        listing = app.list_backups(self.payload["backup_path"])
+        self.assertTrue(listing["backups"][0]["has_settings"])
+        self.target.write_bytes(b'{"new": 1}')
+        restored = app.restore_backup({**self.payload, "restore_settings": True, "backup_name": Path(reset["backup_dir"]).name})
+        self.assertTrue(restored["ok"], restored)
+        self.assertEqual(self.target.read_bytes(), self.original)
+        self.assertEqual((Path(restored["safety_backup"]) / "settings.bin").read_bytes(), b'{"new": 1}')
+
+    def test_changed_settings_cancel_reset(self):
+        preview = app.reset_settings(self.payload, preview=True)
+        self.target.write_bytes(b"changed")
+        with self.assertRaisesRegex(ValueError, "Settings changed"):
+            app.reset_settings({**self.payload, "sha256": preview["sha256"]})
+        self.assertEqual(self.target.read_bytes(), b"changed")
+
+    def test_backup_failure_leaves_settings_unchanged(self):
+        preview = app.reset_settings(self.payload, preview=True)
+        with patch("app.settings_backup", side_effect=OSError("Disk full")):
+            with self.assertRaises(OSError):
+                app.reset_settings({**self.payload, "sha256": preview["sha256"]})
+        self.assertEqual(self.target.read_bytes(), self.original)
+
+    def test_profile_traversal_and_unconfirmed_reset_are_rejected(self):
+        with self.assertRaises(ValueError):
+            app.reset_settings({**self.payload, "profile": "../other"}, preview=True)
+        with self.assertRaises(ValueError):
+            app.reset_settings({**self.payload, "confirmed_stopped": False})
+
+    def test_corrupt_backup_cannot_overwrite_settings(self):
+        preview = app.reset_settings(self.payload, preview=True)
+        reset = app.reset_settings({**self.payload, "sha256": preview["sha256"]})
+        backup = Path(reset["backup_dir"])
+        (backup / "settings.bin").write_bytes(b"tampered")
+        result = app.restore_backup({**self.payload, "restore_settings": True, "backup_name": backup.name})
+        self.assertFalse(result["ok"])
+        self.assertEqual(json.loads(self.target.read_bytes()), {})
+
+
 class ServerLifecycleTests(unittest.TestCase):
     def test_shutdown_endpoint_stops_the_server(self) -> None:
         server = app.ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
@@ -130,6 +189,75 @@ class PythonPackageSafetyTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("safety checks", result["error"])
         self.assertIsNone(result["backup"])
+
+
+class UnknownNodeRemovalTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(__file__).parent / f".path-test-{app.uuid.uuid4().hex}"
+        self.node = self.root / "custom_nodes" / "unknown-package"
+        self.node.mkdir(parents=True)
+        (self.node / "__init__.py").write_bytes(b"# dynamic registration\n")
+        self.addCleanup(shutil.rmtree, self.root)
+        self.scan_id = app.uuid.uuid4().hex
+        self.scan = {
+            "paths": {"custom_nodes": str(self.node.parent), "venv": ""},
+            "custom_nodes": [{"path": str(self.node), "name": self.node.name, "status": "unknown", "confidence": "low"}],
+            "python_packages": {},
+        }
+        app.SCAN_CACHE[self.scan_id] = self.scan
+        self.addCleanup(app.SCAN_CACHE.pop, self.scan_id)
+        self.payload = {"scan_id": self.scan_id, "custom_node_paths": [str(self.node)],
+                        "backup_path": str(self.root / "backups")}
+
+    def test_unknown_requires_boolean_acknowledgment_before_side_effects(self):
+        for acknowledgment in (None, False, "true"):
+            payload = {**self.payload, "acknowledge_unknown_nodes": acknowledgment}
+            self.assertFalse(app.run_clean(payload)["ok"])
+            self.assertFalse(app.calculate_cleanup_size(payload)["ok"])
+            self.assertTrue(self.node.exists())
+            self.assertFalse((self.root / "backups").exists())
+
+    def test_acknowledged_unknown_size_backup_quarantine_and_restore(self):
+        payload = {**self.payload, "acknowledge_unknown_nodes": True}
+        size = app.calculate_cleanup_size(payload)
+        self.assertTrue(size["ok"], size)
+        self.assertEqual(size["total_bytes"], len(b"# dynamic registration\n"))
+        result = app.run_clean(payload)
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(self.node.exists())
+        restored = app.restore_backup({"backup_path": self.payload["backup_path"],
+            "backup_name": Path(result["backup"]["backup_dir"]).name,
+            "restore_custom_nodes": True, "restore_python_packages": False})
+        self.assertTrue(restored["ok"], restored)
+        self.assertEqual((self.node / "__init__.py").read_bytes(), b"# dynamic registration\n")
+
+    def test_acknowledgment_does_not_allow_used_or_unscanned_nodes(self):
+        self.scan["custom_nodes"][0]["status"] = "used"
+        self.assertFalse(app.run_clean({**self.payload, "acknowledge_unknown_nodes": True})["ok"])
+        result = app.validate_cleanup_selection(self.scan, {str(self.root / "other")}, [], True)
+        self.assertTrue(result["invalid_node_paths"])
+
+    def test_python_bom_and_declared_encoding_preserve_dependencies(self):
+        source = self.node / "__init__.py"
+        for data in (b'\xef\xbb\xbfimport trimesh\nNODE_CLASS_MAPPINGS = {"MeshNode": object}\n',
+                     b'# coding: latin-1\n# caf\xe9\nimport trimesh\nNODE_CLASS_MAPPINGS = {"MeshNode": object}\n'):
+            source.write_bytes(data)
+            result = app.parse_python_file(source)
+            self.assertTrue(result.parse_ok)
+            self.assertIn("trimesh", result.imports)
+            self.assertEqual(result.node_types, {"MeshNode"})
+
+    def test_third_party_syntax_warnings_do_not_spam_scan_console(self):
+        source = self.node / "__init__.py"
+        source.write_text('import trimesh\npattern = "\\s"\n', encoding="utf-8")
+        with app.warnings.catch_warnings(record=True) as captured:
+            app.warnings.simplefilter("always")
+            result = app.parse_python_file(source)
+        self.assertTrue(result.parse_ok)
+        self.assertIn("trimesh", result.imports)
+        self.assertEqual(captured, [])
+        source.write_text('def broken(:\n', encoding="utf-8")
+        self.assertFalse(app.parse_python_file(source).parse_ok)
 
 
 class ScanValidationTests(unittest.TestCase):

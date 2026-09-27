@@ -4,6 +4,7 @@ import ast
 import configparser
 import datetime as dt
 import html
+import hashlib
 import json
 import os
 import re
@@ -14,9 +15,11 @@ import subprocess
 import sys
 import threading
 import time
+import tokenize
 import traceback
 import urllib.parse
 import uuid
+import warnings
 import zipfile
 import zlib
 from dataclasses import dataclass, field
@@ -330,11 +333,20 @@ def resolve_comfyui_installation_path(path: Path) -> Path:
     return path.resolve()
 
 
+def parse_source_tree(path: Path) -> ast.Module:
+    # Third-party code is inspected, not executed; compiler warnings are not scan failures.
+    with tokenize.open(path) as handle:
+        source = handle.read()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", SyntaxWarning)
+        return ast.parse(source, filename=str(path))
+
+
 def detect_comfyui_version(comfyui_path: Path) -> str | None:
     version_path = comfyui_path / "comfyui_version.py"
     if version_path.is_file():
         try:
-            tree = ast.parse(version_path.read_text(encoding="utf-8", errors="ignore"))
+            tree = parse_source_tree(version_path)
             for statement in tree.body:
                 if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
                     continue
@@ -613,8 +625,7 @@ def v3_extension_node_classes(class_node: ast.ClassDef) -> tuple[set[str], bool]
 def parse_python_file(path: Path) -> PythonFileAnalysis:
     result = PythonFileAnalysis()
     try:
-        source = path.read_text(encoding="utf-8", errors="ignore")
-        tree = ast.parse(source)
+        tree = parse_source_tree(path)
     except Exception:
         result.parse_ok = False
         result.mapping_complete = False
@@ -874,7 +885,7 @@ def ast_literal_strings(
 
 def setup_py_requirements(path: Path) -> set[str]:
     try:
-        tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"))
+        tree = parse_source_tree(path)
     except Exception:
         return set()
     result: set[str] = set()
@@ -1763,7 +1774,7 @@ def run_scan(
             *([f"Detected ComfyUI version {comfyui_version}."] if comfyui_version else []),
             "Bypassed and muted nodes remain in workflow node lists and are counted as used.",
             "A custom node package is considered unused only when its V1 NODE_CLASS_MAPPINGS or V3 comfy_entrypoint registration can be resolved completely and none of the scanned workflows use those node types.",
-            "Incomplete, dynamic, imported-from-unknown, or unparsable node mappings remain unknown and are never offered for removal.",
+            "Incomplete, dynamic, imported-from-unknown, or unparsable node mappings remain unknown. Manual removal requires acknowledging that these packages may still be needed.",
             "Python detection uses literal dynamic imports, requirements files, pyproject.toml, setup.cfg, setup.py, dependency metadata, and non-CLI entry-point protection.",
             *(
                 ["Unresolved dynamic loading was found in active code, so affected Python package results are marked for review instead of high confidence."]
@@ -1991,6 +2002,90 @@ def read_restore_requirements(requirements_path: Path) -> list[str]:
     return requirements
 
 
+def settings_target(payload: dict[str, Any]) -> Path:
+    raw = str(payload.get("comfyui_path") or "").strip()
+    if not raw:
+        raise ValueError("Set the ComfyUI installation path first.")
+    comfy = resolve_comfyui_installation_path(safe_resolve(raw))
+    if not (comfy / "main.py").is_file():
+        raise ValueError("Invalid ComfyUI installation: main.py was not found.")
+    profile = str(payload.get("profile") or "default").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", profile):
+        raise ValueError("Invalid user profile name.")
+    user_raw = str(payload.get("user_directory") or "").strip()
+    root = safe_resolve(user_raw) if user_raw else comfy / "user"
+    target = root / profile / "comfy.settings.json"
+    for path in (root, target.parent, target):
+        if path.is_symlink() or getattr(path, "is_junction", lambda: False)():
+            raise ValueError("Settings links and junctions are not supported.")
+    target.resolve().relative_to(root.resolve())
+    return target
+
+
+def settings_backup(target: Path, backup_path: str | None) -> Path:
+    root = backup_root_path(backup_path)
+    directory = root / f"{BACKUP_PREFIX}{dt.datetime.now():%Y%m%d-%H%M%S}-settings-{uuid.uuid4().hex[:8]}"
+    directory.mkdir(parents=True)
+    data = target.read_bytes() if target.exists() else None
+    if data is not None:
+        (directory / "settings.bin").write_bytes(data)
+    manifest = {
+        "kind": "settings", "created_at": dt.datetime.now().isoformat(),
+        "paths": {"settings": str(target.resolve())},
+        "settings_existed": data is not None,
+        "sha256": hashlib.sha256(data).hexdigest() if data is not None else None,
+    }
+    (directory / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return directory
+
+
+def replace_settings(target: Path, data: bytes | None) -> None:
+    if data is None:
+        target.unlink(missing_ok=True)
+        return
+    temporary = target.with_name(f".cleaner-settings-{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(data)
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def reset_settings(payload: dict[str, Any], preview: bool = False) -> dict[str, Any]:
+    target = settings_target(payload)
+    if not target.is_file():
+        return {"ok": True, "path": str(target), "exists": False, "message": "No saved settings found. Defaults are already in use."}
+    data = target.read_bytes()
+    digest = hashlib.sha256(data).hexdigest()
+    if preview:
+        return {"ok": True, "path": str(target), "exists": True, "sha256": digest, "bytes": len(data)}
+    if payload.get("confirmed_stopped") is not True:
+        raise ValueError("Stop ComfyUI and close its tabs before resetting settings.")
+    if payload.get("sha256") != digest:
+        raise ValueError("Settings changed. Preview the reset again.")
+    backup = settings_backup(target, str(payload.get("backup_path") or "").strip() or None)
+    if target.read_bytes() != data:
+        raise ValueError("Settings changed during backup; reset was cancelled.")
+    replace_settings(target, b"{}\n")
+    return {"ok": True, "path": str(target), "backup_dir": str(backup), "message": "Settings reset. Start ComfyUI to load defaults."}
+
+
+def restore_settings_backup(backup_dir: Path, manifest: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    if payload.get("confirmed_stopped") is not True:
+        raise ValueError("Stop ComfyUI and close its tabs before restoring settings.")
+    target = settings_target(payload)
+    if str(target.resolve()) != str(manifest["paths"].get("settings")):
+        raise ValueError("Select the original ComfyUI installation, user directory and profile before restoring settings.")
+    data = (backup_dir / "settings.bin").read_bytes() if manifest.get("settings_existed") else None
+    if data is not None and hashlib.sha256(data).hexdigest() != manifest.get("sha256"):
+        raise ValueError("Settings backup integrity check failed.")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    safety_backup = settings_backup(target, str(backup_dir.parent))
+    replace_settings(target, data)
+    return {"ok": True, "settings": str(target), "safety_backup": str(safety_backup)}
+
+
 def list_backups(backup_path_raw: str | None) -> dict[str, Any]:
     root = backup_root_path(backup_path_raw)
     if not root.exists():
@@ -2023,6 +2118,8 @@ def list_backups(backup_path_raw: str | None) -> dict[str, Any]:
             _, validated_dir = managed_backup_directory(str(root), backup_dir.name)
             manifest = read_backup_manifest(validated_dir)
             paths = manifest.get("paths") or {}
+            summary["has_settings"] = manifest.get("kind") == "settings"
+            summary["settings_path"] = str(paths.get("settings") or "")
             summary["created_at"] = str(manifest.get("created_at") or "")
             summary["custom_nodes_path"] = str(paths.get("custom_nodes") or "")
             summary["venv_path"] = str(paths.get("venv") or "")
@@ -2159,6 +2256,15 @@ def restore_python_packages(prepared: dict[str, Any]) -> dict[str, Any]:
 def restore_backup(payload: dict[str, Any]) -> dict[str, Any]:
     backup_path = str(payload.get("backup_path") or "").strip() or None
     backup_name = str(payload.get("backup_name") or "")
+    if payload.get("restore_settings"):
+        try:
+            _, directory = managed_backup_directory(backup_path, backup_name)
+            manifest = read_backup_manifest(directory)
+            if manifest.get("kind") != "settings":
+                raise ValueError("This backup does not contain settings.")
+            return restore_settings_backup(directory, manifest, payload)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
     restore_nodes = bool(payload.get("restore_custom_nodes", True))
     restore_python = bool(payload.get("restore_python_packages", True))
     if not restore_nodes and not restore_python:
@@ -2261,11 +2367,13 @@ def validate_cleanup_selection(
     scan: dict[str, Any],
     selected_node_paths: set[str],
     selected_python_packages: list[str],
+    allow_unknown_nodes: bool = False,
 ) -> dict[str, Any]:
     removable_node_paths = {
         item["path"]
         for item in scan.get("custom_nodes", [])
-        if item.get("status") == "unused" and item.get("confidence") == "high"
+        if (item.get("status") == "unused" and item.get("confidence") == "high")
+        or (allow_unknown_nodes and item.get("status") == "unknown")
     }
     python_validation = validate_python_selection(selected_python_packages, selected_node_paths, scan)
     return {
@@ -2458,7 +2566,8 @@ def calculate_cleanup_size(payload: dict[str, Any]) -> dict[str, Any]:
 
     selected_node_paths = set(str(item) for item in payload.get("custom_node_paths") or [])
     selected_python_packages = [str(item) for item in payload.get("python_packages") or []]
-    validation = validate_cleanup_selection(scan, selected_node_paths, selected_python_packages)
+    validation = validate_cleanup_selection(scan, selected_node_paths, selected_python_packages,
+                                            payload.get("acknowledge_unknown_nodes") is True)
     if validation["invalid_node_paths"] or validation["blocked_python_packages"]:
         return {
             "ok": False,
@@ -2586,7 +2695,8 @@ def run_clean(payload: dict[str, Any]) -> dict[str, Any]:
     backup_enabled = bool(payload.get("backup_enabled", True))
     backup_path = str(payload.get("backup_path") or "").strip()
 
-    validation = validate_cleanup_selection(scan, selected_node_paths, selected_python_packages)
+    validation = validate_cleanup_selection(scan, selected_node_paths, selected_python_packages,
+                                            payload.get("acknowledge_unknown_nodes") is True)
     if validation["invalid_node_paths"] or validation["blocked_python_packages"]:
         return {
             "ok": False,
@@ -2665,6 +2775,8 @@ HTML = r"""<!doctype html>
       --shadow: 0 14px 40px rgba(23, 32, 38, 0.08);
     }
     * { box-sizing: border-box; }
+    dialog { width: min(520px, calc(100vw - 32px)); border: 1px solid #d8dee5; border-radius: 8px; padding: 24px; }
+    dialog::backdrop { background: rgb(0 0 0 / 40%); }
     body {
       margin: 0;
       font-family: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
@@ -3045,6 +3157,22 @@ HTML = r"""<!doctype html>
       </div>
     </div>
 
+    <section class="panel backup-panel" aria-labelledby="resetTitle">
+      <h2 id="resetTitle">Reset settings</h2>
+      <div class="backup-grid">
+        <div><label for="resetUserDirectory">User directory (optional)</label>
+          <div class="path-picker"><input id="resetUserDirectory" type="text" placeholder="Default: ComfyUI/user">
+          <button type="button" class="secondary browse-btn" data-target="resetUserDirectory" data-title="Select ComfyUI user directory">Browse</button></div>
+        </div>
+        <div><label for="resetProfile">User profile</label><input id="resetProfile" type="text" value="default"></div>
+      </div>
+      <p class="muted">Reset Settings-menu preferences, including extension preferences stored in comfy.settings.json. Workflows, browser data and separate extension configuration files are preserved.</p>
+      <div class="checkline"><input id="resetStopped" type="checkbox"><label for="resetStopped">ComfyUI is stopped and its browser tabs are closed</label></div>
+      <div class="actions"><button id="previewResetBtn" class="secondary" type="button">Preview reset</button>
+      <button id="resetSettingsBtn" class="danger" type="button" disabled>Back up and reset settings</button></div>
+      <div id="resetOutput" role="status"></div>
+    </section>
+
     <section class="panel backup-panel" aria-labelledby="backupManagerTitle">
       <div class="toolbar">
         <h2 id="backupManagerTitle">Backup management</h2>
@@ -3065,6 +3193,7 @@ HTML = r"""<!doctype html>
       </div>
       <div id="backupDetails" class="backup-details hidden"></div>
       <div id="backupRestoreOptions" class="actions hidden">
+        <div class="checkline"><input id="restoreSettings" type="checkbox"><label for="restoreSettings">Settings</label></div>
         <div class="checkline">
           <input id="restoreCustomNodes" type="checkbox">
           <label for="restoreCustomNodes">Custom nodes</label>
@@ -3150,6 +3279,15 @@ HTML = r"""<!doctype html>
     </div>
   </main>
 
+  <dialog id="unknownWarning" aria-labelledby="unknownWarningTitle">
+    <form method="dialog">
+      <h2 id="unknownWarningTitle">Unknown does not mean unused</h2>
+      <p>This package may be required by your workflows or extensions. Removing it can break ComfyUI.</p>
+      <p>Keep backups enabled so removed packages can be restored. This warning is shown until accepted, once per page session.</p>
+      <div class="actions"><button value="cancel" class="secondary" autofocus>Cancel</button>
+      <button value="accept" class="danger">I understand, select package</button></div>
+    </form>
+  </dialog>
   <script>
     const $ = (id) => document.getElementById(id);
     let currentScan = null;
@@ -3291,17 +3429,20 @@ HTML = r"""<!doctype html>
       });
     }
 
+    let unknownRemovalAcknowledged = false;
+    let pendingUnknownCheckbox = null;
+
     function renderOtherFindings(scan) {
       const nodes = scan.custom_nodes || [];
       const used = nodes.filter((item) => item.status === "used");
       const unknown = nodes.filter((item) => item.status === "unknown");
       const rows = [
         `<div class="notice"><strong>Custom node packages in use:</strong> ${used.length}</div>`,
-        `<div class="notice"><strong>Unknown custom node packages:</strong> ${unknown.length}. These are not suggested for automatic removal.</div>`,
+        `<div class="notice warn"><strong>Unknown custom node packages:</strong> ${unknown.length}. Usage could not be determined. Select manually only if you accept the risk of breaking workflows or extensions.</div>`,
       ];
       if (unknown.length) {
-        rows.push(`<table class="table"><thead><tr><th>Package</th><th>Path</th><th>Reason</th></tr></thead><tbody>${
-          unknown.map((item) => `<tr><td>${escapeHtml(item.name)}</td><td class="path">${escapeHtml(item.path)}</td><td>${escapeHtml((item.evidence || []).join("; "))}</td></tr>`).join("")
+        rows.push(`<table class="table"><thead><tr><th>Select</th><th>Package</th><th>Path</th><th>Reason</th></tr></thead><tbody>${
+          unknown.map((item) => `<tr><td><input type="checkbox" class="node-check unknown-node-check" aria-label="Remove ${escapeHtml(item.name)} (unknown usage)" value="${escapeHtml(item.path)}"></td><td>${escapeHtml(item.name)}</td><td class="path">${escapeHtml(item.path)}</td><td>${escapeHtml((item.evidence || []).join("; "))}</td></tr>`).join("")
         }</tbody></table>`);
       }
       $("otherFindings").innerHTML = rows.join("");
@@ -3375,13 +3516,15 @@ HTML = r"""<!doctype html>
 
     function updateBackupButtons() {
       const item = selectedBackup();
-      const selectedComponent = $("restoreCustomNodes").checked || $("restorePythonPackages").checked;
+      const selectedComponent = $("restoreCustomNodes").checked || $("restorePythonPackages").checked || $("restoreSettings").checked;
       $("restoreBackupBtn").disabled = backupBusy || !item || !item.valid || !selectedComponent;
       $("deleteBackupBtn").disabled = backupBusy || !item;
     }
 
     function renderBackupSelection() {
       const item = selectedBackup();
+      $("restoreSettings").checked = Boolean(item && item.valid && item.has_settings);
+      $("restoreSettings").disabled = backupBusy || !item || !item.valid || !item.has_settings;
       $("backupOutput").innerHTML = "";
       if (!item) {
         $("backupDetails").classList.add("hidden");
@@ -3396,7 +3539,7 @@ HTML = r"""<!doctype html>
       $("backupRestoreOptions").classList.remove("hidden");
       $("backupDetails").innerHTML = item.valid ? `
         <div><strong>Created</strong>${escapeHtml(backupDateLabel(item.created_at))}</div>
-        <div><strong>Contents</strong>${item.custom_node_count} custom node package(s), ${item.python_package_count} Python package(s)</div>
+        <div><strong>Contents</strong>${item.has_settings ? "Settings: " + escapeHtml(item.settings_path) : `${item.custom_node_count} custom node package(s), ${item.python_package_count} Python package(s)`}</div>
         <div><strong>Custom nodes destination</strong><span class="path">${escapeHtml(item.custom_nodes_path || "Not included")}</span></div>
         <div><strong>Virtual environment</strong><span class="path">${escapeHtml(item.venv_path || "Not included")}</span></div>
         <div><strong>Backup size</strong>${escapeHtml(formatBytes(item.size_bytes))}</div>
@@ -3584,6 +3727,46 @@ HTML = r"""<!doctype html>
     });
 
     $("refreshBackupsBtn").addEventListener("click", () => loadBackups());
+    let resetPreview = null;
+    function resetPayload() {
+      return {comfyui_path: $("comfyPath").value, user_directory: $("resetUserDirectory").value,
+        profile: $("resetProfile").value, confirmed_stopped: $("resetStopped").checked,
+        backup_path: $("backupManagerPath").value};
+    }
+    function invalidateReset() {
+      resetPreview = null;
+      $("resetSettingsBtn").disabled = true;
+    }
+    ["comfyPath", "resetUserDirectory", "resetProfile"].forEach(id => $(id).addEventListener("input", invalidateReset));
+    $("previewResetBtn").addEventListener("click", async () => {
+      invalidateReset();
+      $("previewResetBtn").disabled = true;
+      try {
+        const payload = resetPayload();
+        const result = await postJson("/api/settings/preview", payload);
+        resetPreview = result.exists ? {payload, sha256: result.sha256} : null;
+        $("resetSettingsBtn").disabled = !resetPreview;
+        $("resetOutput").textContent = result.exists ? `Reset target: ${result.path} (${formatBytes(result.bytes)}). A backup will be created before reset.` : result.message;
+      } catch (error) { $("resetOutput").textContent = error.message; }
+      finally { $("previewResetBtn").disabled = false; }
+    });
+    $("resetSettingsBtn").addEventListener("click", async () => {
+      if (!resetPreview) return;
+      const payload = resetPayload();
+      if (!payload.confirmed_stopped) { $("resetOutput").textContent = "Stop ComfyUI, close its tabs and check the confirmation box."; return; }
+      if (["comfyui_path", "user_directory", "profile"].some(key => payload[key] !== resetPreview.payload[key])) {
+        invalidateReset(); $("resetOutput").textContent = "Paths changed. Preview the reset again."; return;
+      }
+      if (!window.confirm("Back up and reset this profile's Settings-menu preferences?")) return;
+      $("resetSettingsBtn").disabled = true;
+      try {
+        const result = await postJson("/api/settings/reset", {...payload, sha256: resetPreview.sha256});
+        $("resetOutput").textContent = `${result.message} Backup: ${result.backup_dir || "Not needed"}`;
+        await loadBackups(false);
+      } catch (error) { $("resetOutput").textContent = error.message; }
+      finally { invalidateReset(); }
+    });
+    $("restoreSettings").addEventListener("change", updateBackupButtons);
     $("backupManagerPath").addEventListener("change", () => loadBackups(false));
     $("backupSelect").addEventListener("change", renderBackupSelection);
     $("restoreCustomNodes").addEventListener("change", updateBackupButtons);
@@ -3594,7 +3777,11 @@ HTML = r"""<!doctype html>
       if (!item || !item.valid) return;
       const restoreNodes = $("restoreCustomNodes").checked;
       const restorePython = $("restorePythonPackages").checked;
-      const components = [restoreNodes ? "custom nodes" : "", restorePython ? "Python packages" : ""].filter(Boolean);
+      const restoreSettings = $("restoreSettings").checked;
+      if (restoreSettings && !$("resetStopped").checked) {
+        $("backupStatus").textContent = "Stop ComfyUI, close its tabs and check the confirmation box in Reset settings."; return;
+      }
+      const components = [restoreNodes ? "custom nodes" : "", restorePython ? "Python packages" : "", restoreSettings ? "settings (current settings will be backed up first)" : ""].filter(Boolean);
       if (!components.length) return;
       const ok = window.confirm(`Restore ${components.join(" and ")} from ${item.name}? ComfyUI should be stopped during restoration.`);
       if (!ok) return;
@@ -3603,6 +3790,8 @@ HTML = r"""<!doctype html>
       $("backupOutput").innerHTML = `<div class="notice">Restoration is running.</div>`;
       try {
         const result = await postJson("/api/backups/restore", {
+          ...resetPayload(),
+          restore_settings: restoreSettings,
           backup_path: $("backupManagerPath").value,
           backup_name: item.name,
           restore_custom_nodes: restoreNodes,
@@ -3678,13 +3867,13 @@ HTML = r"""<!doctype html>
     });
 
     $("selectNodesBtn").addEventListener("click", () => {
-      document.querySelectorAll(".node-check").forEach((box) => { box.checked = true; });
+      document.querySelectorAll("#unusedNodes .node-check").forEach((box) => { box.checked = true; });
       syncDependentPythonChoices();
       clearSizeEstimate();
     });
 
     $("deselectNodesBtn").addEventListener("click", () => {
-      document.querySelectorAll(".node-check").forEach((box) => { box.checked = false; });
+      document.querySelectorAll("#unusedNodes .node-check").forEach((box) => { box.checked = false; });
       syncDependentPythonChoices();
       clearSizeEstimate();
     });
@@ -3696,6 +3885,29 @@ HTML = r"""<!doctype html>
 
     $("deselectPyBtn").addEventListener("click", () => {
       document.querySelectorAll(".py-check").forEach((box) => { box.checked = false; });
+      clearSizeEstimate();
+    });
+
+    $("otherFindings").addEventListener("change", (event) => {
+      const box = event.target;
+      if (!box.matches(".unknown-node-check")) return;
+      if (box.checked && !unknownRemovalAcknowledged) {
+        box.checked = false;
+        pendingUnknownCheckbox = box;
+        $("unknownWarning").returnValue = "cancel";
+        $("unknownWarning").showModal();
+      }
+      syncDependentPythonChoices();
+      clearSizeEstimate();
+    });
+
+    $("unknownWarning").addEventListener("close", () => {
+      if ($("unknownWarning").returnValue === "accept" && pendingUnknownCheckbox?.isConnected) {
+        unknownRemovalAcknowledged = true;
+        pendingUnknownCheckbox.checked = true;
+      }
+      pendingUnknownCheckbox = null;
+      syncDependentPythonChoices();
       clearSizeEstimate();
     });
 
@@ -3726,6 +3938,7 @@ HTML = r"""<!doctype html>
         const result = await postJson("/api/calculate-size", {
           scan_id: currentScan.scan_id,
           custom_node_paths: nodePaths,
+          acknowledge_unknown_nodes: unknownRemovalAcknowledged,
           python_packages: pythonPackages
         });
         if (requestVersion !== sizeRequestVersion) return;
@@ -3769,6 +3982,7 @@ HTML = r"""<!doctype html>
         const result = await postJson("/api/clean", {
           scan_id: currentScan.scan_id,
           custom_node_paths: nodePaths,
+          acknowledge_unknown_nodes: unknownRemovalAcknowledged,
           python_packages: pythonPackages,
           backup_enabled: $("backupEnabled").checked,
           backup_path: $("backupPath").value
@@ -3916,6 +4130,19 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/api/backups/list":
                 result = list_backups(str(payload.get("backup_path") or "").strip() or None)
                 self.send_json(result, 200 if result.get("ok") else 400)
+                return
+            if self.path in {"/api/settings/preview", "/api/settings/reset"}:
+                block_reason = begin_exclusive_operation("Settings reset")
+                if block_reason:
+                    self.send_json({"ok": False, "error": block_reason}, 409)
+                    return
+                try:
+                    result = reset_settings(payload, preview=self.path.endswith("/preview"))
+                    self.send_json(result)
+                except (ValueError, OSError) as exc:
+                    self.send_json({"ok": False, "error": str(exc)}, 400)
+                finally:
+                    end_exclusive_operation()
                 return
             if self.path == "/api/backups/restore":
                 block_reason = begin_exclusive_operation("Backup restore")

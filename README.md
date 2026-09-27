@@ -45,6 +45,14 @@ http://127.0.0.1:8765
 - Runs only one scan or cleanup operation at a time and prevents shutdown while one is active.
 - Recognizes a Windows Portable root containing `ComfyUI` and its sibling `python_embeded` directory.
 
+## Reset Settings
+
+Use **Preview reset** to inspect the selected profile's `comfy.settings.json`, then stop ComfyUI, close its tabs, and choose **Back up and reset settings**. The profile defaults to `default`; specify a user directory when using ComfyUI's `--user-directory` option. Backups use the folder selected in Backup management.
+
+Reset affects Settings-menu preferences, including extension preferences stored in that file. It does not clear browser storage, workflows, models, outputs, or separate custom-node configuration files. A missing settings file already uses defaults. Changed files require a new preview, and backup failures prevent reset.
+
+Settings backups appear in **Backup management**. Select **Settings** and **Restore selected** with the original installation, user directory and profile selected. Restoration backs up current settings before replacing them. Keep ComfyUI stopped during restoration.
+
 ## Cleanup
 
 Before cleanup, the application creates a backup by default. If the backup folder is left empty, the backup is created in the application's own `backups` folder.
@@ -63,7 +71,9 @@ python -m pip uninstall -y <packages>
 
 Python packages categorized as required only by unused custom nodes remain locked until every related custom node package is also selected for removal. The server validates this relationship again before cleanup.
 
-Static analysis is conservative: uncertain custom nodes are not removable, while Python packages with no detected use are explicitly labeled as review candidates rather than proven unnecessary.
+Unknown custom node packages can be selected manually. The first selection on each page load asks you to acknowledge that unknown does not mean unused and removal may break workflows or extensions. Cancelling leaves the package unselected. The unused-package Select all button excludes unknown packages. Manual selections participate in size calculation, backup, quarantine, and restoration. Their Python dependencies remain protected by the existing dependency analysis.
+
+Compatibility checked against ComfyUI v0.37.0 (2026-09-27), including V1 and V3 registration and declared Python requirements. Python source files are read using Python's encoding detection, including UTF-8 BOM and encoding declarations. Python packages with no detected use remain review candidates rather than proven unnecessary.
 
 ## Backups
 
